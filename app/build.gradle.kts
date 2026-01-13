@@ -11,7 +11,7 @@ android {
 
     defaultConfig {
         applicationId = "com.example.sound_detection"
-        minSdk = 33
+        minSdk = 28
         targetSdk = 34
         versionCode = 1
         versionName = "1.0"
@@ -19,7 +19,7 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk {
             // For Python 3.11.5, you should include:
-            abiFilters += listOf("arm64-v8a", "x86_64", "armeabi-v7a", "x86")
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64","x86")
         }
     }
 
@@ -42,6 +42,13 @@ android {
     buildFeatures {
         compose = true
     }
+
+}
+
+// Exclude the old Google litert artifacts from every configuration:
+configurations.all {
+    exclude(group = "com.google.ai.edge.litert", module = "litert-api")
+    exclude(group = "com.google.ai.edge.litert", module = "litert-support-api")
 }
 
 chaquopy {
@@ -63,7 +70,6 @@ chaquopy {
 
 
 dependencies {
-
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.activity.compose)
@@ -72,6 +78,7 @@ dependencies {
     implementation(libs.androidx.ui.graphics)
     implementation(libs.androidx.ui.tooling.preview)
     implementation(libs.androidx.material3)
+    implementation(libs.androidx.appcompat)
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
@@ -79,7 +86,18 @@ dependencies {
     androidTestImplementation(libs.androidx.ui.test.junit4)
     debugImplementation(libs.androidx.ui.tooling)
     debugImplementation(libs.androidx.ui.test.manifest)
-    implementation(libs.tensorflow.lite)
-    implementation(libs.tensorflow.lite.support)
+    implementation("org.tensorflow:tensorflow-lite-support:0.4.4")
+    implementation("org.tensorflow:tensorflow-lite:2.17.0")
+    implementation("org.tensorflow:tensorflow-lite-task-audio:0.4.4") {
+        exclude(group = "com.google.ai.edge.litert", module = "litert-api")
+        exclude(group = "com.google.ai.edge.litert", module = "litert-support-api")
+    }
+    implementation("com.squareup.okhttp3:okhttp:4.11.0") //(optional, for HTTP if needed)
+
+    // WebSocket client for ESP32 streaming
+    implementation("org.java-websocket:Java-WebSocket:1.5.4")
+
+
+
 
 }

@@ -9,8 +9,11 @@ lifecycleRuntimeKtx = "2.8.7"
 activityCompose = "1.10.1"
 composeBom = "2024.04.01"
 tensorflowLite = "2.17.0"
-tensorflowLiteSupport = "0.5.0"
+tensorflowLiteSupport = "0.4.4"
 chaquopy = "16.0.0"
+tensorflowLiteTaskAudio = "0.4.4"
+appcompat = "1.7.1"
+
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
@@ -31,7 +34,8 @@ tensorflow-lite = { group = "org.tensorflow", name = "tensorflow-lite", version.
 tensorflow-lite-support = { group = "org.tensorflow", name = "tensorflow-lite-support", version.ref = "tensorflowLiteSupport" }
 android-gradle-plugin = { group = "com.android.tools.build", name = "gradle", version.ref = "agp" }
 kotlin-gradle-plugin = { group = "org.jetbrains.kotlin", name = "kotlin-gradle-plugin", version.ref = "kotlin" }
-
+tensorflowLiteTaskAudio = { group = "org.tensorflow", name  = "tensorflow-lite-task-audio", version.ref = "tensorflowLiteTaskAudio" }
+androidx-appcompat = { group = "androidx.appcompat", name = "appcompat", version.ref = "appcompat" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

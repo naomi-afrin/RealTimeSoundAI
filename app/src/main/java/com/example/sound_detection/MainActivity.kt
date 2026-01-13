@@ -2,8 +2,7 @@ package com.example.sound_detection
 
 import android.Manifest
 import android.content.pm.PackageManager
-import android.media.AudioRecord
-import android.media.MediaRecorder
+import android.media.*
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -19,60 +18,91 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.example.sound_detection.ui.theme.Sound_detectionTheme
-import java.io.IOException
+import kotlinx.coroutines.*
+import org.tensorflow.lite.Interpreter
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.nio.channels.FileChannel
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
+import okhttp3.*
 import java.util.concurrent.TimeUnit
-import com.chaquo.python.Python
-import com.chaquo.python.android.AndroidPlatform
-import com.chaquo.python.PyObject
-import kotlin.reflect.typeOf
-import kotlinx.coroutines.*
-import android.media.AudioManager
-import android.media.AudioAttributes
-import android.media.AudioFormat
-import android.media.AudioTrack
-import org.tensorflow.lite.Interpreter
-import java.nio.channels.FileChannel
+import org.java_websocket.client.WebSocketClient
+import org.java_websocket.handshake.ServerHandshake
+import java.net.URI
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
+import androidx.appcompat.app.AppCompatDelegate //
+import androidx.compose.foundation.background
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.ui.graphics.Color
+
+// progressbar
+private var recordingProgress by mutableStateOf(0f) // 0f = 0%, 1f = 100%
 
 
 
 
 
+        class MainActivity : ComponentActivity() {
 
-
-
-
-class MainActivity : ComponentActivity() {
-
-    private lateinit var soundClassifier: SoundClassifier
-    private lateinit var labels: List<String>
-    private var detectionResult by mutableStateOf("Waiting to Start...")
-    private var confidence by mutableStateOf("")
+    // === TFLite model + UI state ===
+    private lateinit var tflite: Interpreter
+    private val MODEL_PATH = "my_5layer_model2.tflite"
+    private var resultText by mutableStateOf("Waiting to Start...")
+    private var resultText2 by mutableStateOf("")
     private var isRecording by mutableStateOf(false)
-    private lateinit var audioRecord: AudioRecord
-    private lateinit var recordingThread: Thread
-    private val executor: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor()
-    private val handler = Handler(Looper.getMainLooper())
+    private var isPlaying by mutableStateOf(false)
+    private var lastBuffer: ShortArray? = null  // store the last recorded buffer
 
-    private val sampleRate = 22050
+
+    // For showing both results
+    private var lastPrediction: String = ""
+    private var lastConfidence: String = ""
+    private var lastDirection: String = ""
+
+    // For showing both results
+    private var viewPrediction: String = "unknown"
+    private var viewConfidence: String = "unknown"
+    private var viewDirection: String = "unknown"
+
+    // === Audio config ===
+    private val sampleRate = 16000
     private val channelConfig = AudioFormat.CHANNEL_IN_MONO
     private val audioFormat = AudioFormat.ENCODING_PCM_16BIT
     private var bufferSize = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
-    private lateinit var audioData: ShortArray
-    private lateinit var byteBuffer: ByteBuffer
-    private val inputLength = 128 * 128
-    private val outputLength = 4
-    private val recordingIntervalMillis: Long = 3000
-    private lateinit var tflite: Interpreter  // 👈 to store model
-    private val MODEL_PATH = "sound_classifier_2_17.tflite"
-    private var play = false
-    private var lastBuffer: ShortArray? = null
-    private var playButton = "Play Audio"
+    private lateinit var audioRecord: AudioRecord
+    private val outputLength = 5
+    private var valuesFound = false
 
 
+
+
+    // threading
+    private val handler = Handler(Looper.getMainLooper())
+
+    // === ESP32 WebSocket client ===
+    private val esp32WebSocketUrl = "ws://192.168.4.1:81"
+//    private var okHttpClient: OkHttpClient? = null
+//    private var webSocket: WebSocket? = null
+
+    private lateinit var espWebSocket: WebSocketClient
+    private var isWebSocketConnected = false
+
+    // Colors
+    val darkBackground = Color(0xFF121212)
+    val cardBackground = Color(0xFF1E1E1E)
+    val buttonBlue = Color(0xFF1E88E5)
+    val textWhite = Color.White
+    val textGray = Color(0xFFB0B0B0)
+
+    // for progress bar
+    private var progressOn = false
+
+
+
+    // Load TFLite model
     private fun loadModel(): Interpreter {
         val assetFileDescriptor = assets.openFd(MODEL_PATH)
         val fileInputStream = assetFileDescriptor.createInputStream()
@@ -83,295 +113,402 @@ class MainActivity : ComponentActivity() {
         return Interpreter(modelBuffer)
     }
 
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        tflite = loadModel() // ← call Interpreter
-        // Initialize Python
-        if (!Python.isStarted()) {
-            Python.start(AndroidPlatform(this))
-        }
+        tflite = loadModel()
+        setupESPWebSocket()
+        AppCompatDelegate.setDefaultNightMode(AppCompatDelegate.MODE_NIGHT_YES)
+
+
 
         setContent {
-            Sound_detectionTheme {
-                // UI Layout
+            Sound_detectionTheme{ // <-- force dark theme
                 Column(
-                    modifier = Modifier.fillMaxSize(),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.Center
+                        modifier = Modifier
+                                .fillMaxSize()
+                                .background(darkBackground)
+                                .padding(16.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.Center
                 ) {
-                    // Show the detection result
                     Text(
-                        text = detectionResult,
-                        style = MaterialTheme.typography.headlineMedium,
-                        modifier = Modifier.padding(16.dp)
+                            text = resultText,
+                            style = MaterialTheme.typography.headlineMedium,
+                            color = Color(0xFFFFFFFF), // White text
+                            modifier = Modifier.padding(16.dp)
+
                     )
 
-                    // Start Button
+
+                    // Linear progress bar
+                    LinearProgressIndicator(
+                            progress = { recordingProgress },  // lambda returning current progress
+                            modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(20.dp)   // adjust thickness
+                                    .padding(bottom = 16.dp),
+                            color = Color(0xFF2962FF),      // blue color
+                            trackColor = Color(0xFF555555)  // dark gray track
+                    )
+
+
+
+                    // Start/Stop toggle button
                     Button(
-                        onClick = {
-                            if (!isRecording) {
-                                if (hasRecordAudioPermission()) {
-                                    startRecordingLoop()  // Start recording if permission is granted
-                                    detectionResult = "Recording Started..."
-                                } else {
-                                    // Request permission if not granted
-                                    requestPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-                                }
-                            }
+                            onClick = {
+                    if (!isRecording) {
+                        if (hasRecordAudioPermission()) {
+                            resultText = "Recording..."
+                            resultText2 = ""
+                            startPhoneRecordingLoop()
+                        } else {
+                            requestPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                        }
+                    } else {
+                        stopRecording()
+                    }
                         },
-                        modifier = Modifier.padding(16.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary) // Filled button
+                    colors = ButtonDefaults.buttonColors(
+                            containerColor = Color(0xFF2962FF), // Blue
+                            contentColor = Color.White           // Text color
+                    ),
+                            modifier = Modifier.padding(8.dp)
                     ) {
-                        Text(text = "Start Recording")
+                        Text(if (!isRecording) "Start Recording" else "Stop Recording")
                     }
 
-                    // Stop Button
-                    Button(
-                        onClick = {
-                            stopRecording()  // Stop recording when the button is pressed
-                            detectionResult = "Recording Stopped."
-                        },
-                        modifier = Modifier.padding(16.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary) // Filled button
-                    ) {
-                        Text(text = "Stop Recording")
-                    }
 
-                    // Play back button
-                    Button(
-                        onClick = {
-                            if (play == true){
-                                play = false
-                                playButton = "Play Audio"
-                            }
-                            else{
-                                Log.d("play","play is true")
-                                play = true
-                                playButton = "Stop Audio"
-                            }
-                        },
-                        modifier = Modifier.padding(16.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary) // Filled button
-                    ) {
-                        Text(text = playButton)
-                    }
+
+
+//                    // Playback button
+//                    Button(
+//                            onClick = {
+//                                    lastBuffer?.let {
+//                        if (!isPlaying) {
+//                            isPlaying = true
+//                        } else {
+//                            // Stop playback
+//                            isPlaying = false
+//                            // Implement AudioTrack stop if needed
+//                        }
+//                    }
+//                        },
+//                    modifier = Modifier.padding(8.dp)
+//                    ) {
+//                        Text(if (!isPlaying) "Play Audio" else "Stop Audio")
+//                    }
+//                    Spacer(modifier = Modifier.height(16.dp))
+
+                    // Direction and Confidence Text
+                    Text(
+                            text = resultText2,
+                            color = Color(0xFFB0B0B0), // Light gray
+                            style = MaterialTheme.typography.bodyMedium,
+                            modifier = Modifier.padding(8.dp)
+                    )
+
                 }
             }
         }
-
     }
 
-
-
+    // Permission
     private val requestPermissionLauncher =
-        registerForActivityResult(ActivityResultContracts.RequestPermission()) { isGranted: Boolean ->
-            if (isGranted) {
-                startRecordingLoop() // Start recording if permission is granted
-            } else {
-                detectionResult = "Permission to record audio denied."
-            }
-        }
+            registerForActivityResult(ActivityResultContracts.RequestPermission()) { isGranted ->
+        if (isGranted) startPhoneRecordingLoop()
+        else resultText = "Permission to record audio denied."
+    }
 
     private fun hasRecordAudioPermission(): Boolean {
         return ContextCompat.checkSelfPermission(
-            this,
-            Manifest.permission.RECORD_AUDIO
+                this,
+                Manifest.permission.RECORD_AUDIO
         ) == PackageManager.PERMISSION_GRANTED
     }
 
-    // initialize the AudioRecord object.
+    // -------------------------
+    // PHONE RECORDING LOOP
+    // -------------------------
     private fun initializeAudioRecord() {
         bufferSize = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
         audioRecord = AudioRecord(
-            MediaRecorder.AudioSource.MIC,
-            sampleRate,
-            channelConfig,
-            audioFormat,
-            bufferSize
+                MediaRecorder.AudioSource.MIC,
+                sampleRate,
+                channelConfig,
+                audioFormat,
+                bufferSize
         )
-        audioData = ShortArray(bufferSize)
-
     }
 
+    private fun animateRecordingProgress() {
+        CoroutineScope(Dispatchers.Main).launch {
+            while (isRecording) {
+                val totalDuration = 3000L  // 3 seconds
+                val stepTime = 16L         // update ~60 FPS
+                val steps = (totalDuration / stepTime).toInt()
 
-    private fun stopRecording() {
-        // Stop recording and release resources
-        if (isRecording) {
-            isRecording = false
-            audioRecord.stop()
-            audioRecord.release()
-            Log.d("AudioRecord", "Recording stopped and resources released.")
+                for (i in 1..steps) {
+                    if (!isRecording) break
+//                    if (!progressOn)break
+                    recordingProgress = i / steps.toFloat()
+                    delay(stepTime)
+                }
+
+                if(lastPrediction == ""){
+                    Log.d("pause", "pause")
+                    delay(100)
+                }
+
+
+                Log.d("Result", "Going to updateUIWithResults() function")
+                recordingProgress = 0f  // reset after 3s
+                // ✅ Now update UI when progress bar finishes
+                if (isRecording) {
+                    updateUIWithResults()
+                    withContext(Dispatchers.Main) {
+                        resultText = "Prediction: $viewPrediction\nDirection: $viewDirection"
+                        resultText2 = "Confidence: $viewConfidence%"
+                    }
+
+                }
+
+            }
         }
     }
 
 
-
-    private fun startRecordingLoop() {
-        if (!hasRecordAudioPermission()) {
-            detectionResult = "Permission not granted!"
-            return
-        }
-
+    private fun startPhoneRecordingLoop() {
         initializeAudioRecord()
         isRecording = true
+        animateRecordingProgress()  // start smooth progress animation
 
 
         CoroutineScope(Dispatchers.IO).launch {
             while (isRecording) {
+                valuesFound= false
                 audioRecord.startRecording()
-                detectionResult = "will record for 3 seconds"
-                val buffer = ShortArray(sampleRate * 3) // creates buffer of 3 seconds of audio at 22050 Hz
+//                withContext(Dispatchers.Main) {
+//                    resultText = "Prediction: $viewPrediction\nDirection: $viewDirection"
+//                    resultText2 = "Confidence: $viewConfidence%"
+//                }
+                Log.d("record", "Recording from phone for 3 seconds started")
+                val buffer = ShortArray(sampleRate * 3) // 3s buffer
                 var totalRead = 0
-
-                while (totalRead < buffer.size) {
-                    val read = audioRecord.read(
-                        buffer,
-                        totalRead,
-                        buffer.size - totalRead
-                    ) // recorded audio data from the AudioRecord object into a buffer.
-                    if (read > 0) {
-                        totalRead += read
-                    }
+                while (totalRead < buffer.size && isRecording) {
+                    val read = audioRecord.read(buffer, totalRead, buffer.size - totalRead)
+                    if (read > 0) totalRead += read
                 }
-                val startTime = System.currentTimeMillis()
 
-                detectionResult = "3 seconds of audio recorded."
-                // for playing audio
-                Log.d("AudioRecord", "will play audio because play is $play")
-                if (play == true){
+
+                lastBuffer = buffer  // store last 3-second audio
+
+
+                val startTime = System.currentTimeMillis()
+                Log.d("Direction", "Going to requestDirectionFromESP32() function")
+                // Ask ESP32 for direction
+                requestDirectionFromESP32()
+
+                Log.d("Model", "Going to runModel() function")
+                // Run ML model
+                runModel(buffer)
+                Log.d("Result", "Got results")
+                valuesFound = true
+
+
+//                Log.d("Result", "Going to updateUIWithResults() function")
+                // Update UI with latest prediction, confidence, and direction
+//                progressOn = false  // stop progress and reset bar
+//                updateUIWithResults()
+
+                if (isPlaying  == true){
                     playAudio(buffer)
                 }
-                
-                // for sending to python
-                // Convert ShortArray to FloatArray and normalize it
-                val floatInput = buffer.map { it.toFloat() / 32768.0f }.toFloatArray()
-
-
-                // max and min of floatInput and buffer
-                findMaxAndMinValues(buffer)
-                val maxValue = floatInput.maxOrNull() ?: 0f
-                val minValue = floatInput.minOrNull() ?: 0f
-
-                Log.d("FloatInput", "Max float value: $maxValue")
-                Log.d("FloatInput", "Min float value: $minValue")
-
-                // Call Python preprocessing
-                val inputTensor4D = preprocessWithPython(floatInput)
-                Log.d("Preprocess", "Preprocessed tensor shape: ${inputTensor4D.size}")
-
-
-                // model prediction
-                // Create a container for the output
-                val output = Array(1) { FloatArray(outputLength) }
-                Log.d("AudioRecord", "will run model")
-                // Run inference
-                tflite.run(inputTensor4D, output)
-
-                // Find the predicted label and confidence
-                val predictedIndex = output[0].indices.maxByOrNull { output[0][it] } ?: -1
-                val predictedLabel = when (predictedIndex) {
-                    0 -> "Other"
-                    1 -> "Car Horn"
-                    2 -> "Dog Bark"
-                    3 -> "Scream"
-                    else -> "Unknown"
-                }
-                val predictionConfidence = output[0].getOrNull(predictedIndex)?.let { "%.2f".format(it * 100) } ?: "N/A"
-                detectionResult = "result is"
-                // Update UI
-                withContext(Dispatchers.Main) {
-                    detectionResult = "Detected: $predictedLabel"
-                    confidence = "Confidence: $predictionConfidence%"
-                }
-
-
-         
-                delay(1000) // rest of the 1 wait
                 val endTime = System.currentTimeMillis()
-                val duration = endTime - startTime
+                Log.d("Time", "Time taken between recording: ${endTime - startTime}ms")
 
-                Log.d("DetectionTime", "Inference took $duration ms")
+
 
             }
         }
-
     }
 
+    private fun runModel(buffer: ShortArray) {
+        val floatInput = buffer.map { it.toFloat() / 32768.0f }.toFloatArray()
+        val input2D = arrayOf(floatInput)
+        val output = Array(1) { FloatArray(outputLength) }
 
+        tflite.run(input2D, output)
 
-    fun preprocessWithPython(floatInput: FloatArray): Array<Array<Array<FloatArray>>> {
-        val py = Python.getInstance()
-        val pyFunction = py.getModule("sound_classifier") // Get the Python module named 'sound_classifier'
-        val inpTensor_4D: Array<Array<Array<FloatArray>>> = pyFunction.callAttr("preprocess_audio", floatInput).toJava(Array<Array<Array<FloatArray>>>::class.java)
-        println("inpTensor_4D: $inpTensor_4D")
-        return inpTensor_4D
+        val predictedIndex = output[0].indices.maxByOrNull { output[0][it] } ?: -1
+        val predictedLabel = when (predictedIndex) {
+            0 -> "Other"
+            1 -> "Car Horn 🚗"
+            2 -> "Scream 🔊"
+            3 -> "Dog Bark 🐕"
+            4 -> "Calling Bell 🔔"
+            else -> "Unknown"
+        }
+        val predictionConfidence =
+                output[0].getOrNull(predictedIndex)?.let { "%.2f".format(it * 100) } ?: "N/A"
 
+        lastPrediction = predictedLabel
+        lastConfidence = predictionConfidence
+        Log.d("Model", "Prediction: $predictedLabel, Confidence: $predictionConfidence")
     }
 
-
-
-    // to check max and min value in buffer
-    fun findMaxAndMinValues(buffer: ShortArray) {
-        var maxValue = Short.MIN_VALUE
-        var minValue = Short.MAX_VALUE
-
-        for (i in buffer.indices) {
-            if (buffer[i] > maxValue) {
-                maxValue = buffer[i]
+    // -------------------------
+    // ESP32 WEBSOCKET
+    // -------------------------
+    private fun setupESPWebSocket() {
+        val wsUri = URI("ws://192.168.4.1:81/")
+        espWebSocket = object : WebSocketClient(wsUri) {
+            override fun onOpen(handshakedata: ServerHandshake?) {
+                isWebSocketConnected = true
+                Log.d("ESP32-WS", "Connected to ESP32")
             }
-            if (buffer[i] < minValue) {
-                minValue = buffer[i]
+
+            override fun onMessage(message: String?) {
+                message?.let {
+                    lastDirection = it
+//                    handler.post {
+//                        resultText =
+//                            "Prediction: $lastPrediction\nConfidence: $lastConfidence%\nDirection: $lastDirection"
+//                    }
+                }
+            }
+
+            override fun onClose(code: Int, reason: String?, remote: Boolean) {
+                isWebSocketConnected = false
+                Log.d("ESP32-WS", "WebSocket closed: $reason")
+            }
+
+            override fun onError(ex: Exception?) {
+                isWebSocketConnected = false
+                Log.e("ESP32-WS", "WebSocket error: ${ex?.message}")
             }
         }
-
-        Log.d("AudioBuffer", "Maximum value in the buffer: $maxValue")
-        Log.d("AudioBuffer", "Minimum value in the buffer: $minValue")
+        espWebSocket.connect()
     }
-    
-    fun playAudio(buffer: ShortArray){
-        Log.d("AudioRecord", "Playing back recorded audio.")
-
-        // for playing audio
-        val audioTrack = AudioTrack(
-            AudioAttributes.Builder()
-                .setUsage(AudioAttributes.USAGE_MEDIA)
-                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                .build(),
-            AudioFormat.Builder()
-                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                .setSampleRate(sampleRate)
-                .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                .build(),
-            buffer.size * 2,
-            AudioTrack.MODE_STATIC,
-            AudioManager.AUDIO_SESSION_ID_GENERATE
-        )
 
 
-        // Play back the recorded audio
-        val audioBuffer = ByteBuffer.allocate(buffer.size * 2).order(ByteOrder.LITTLE_ENDIAN)
-        buffer.forEach { audioBuffer.putShort(it) }
+    private fun requestDirectionFromESP32() {
+        if (isWebSocketConnected) {
+            espWebSocket.send("GET_DIRECTION")
+            Log.d("ESP32-WS", "Sent GET_DIRECTION")
+        } else {
+            Log.d("ESP32-WS", "WebSocket not connected yet")
+            viewDirection = "socketFalse"
+        }
+    }
 
+    // Function to Vibrate
+    private fun vibrateOneSecond() {
+        val vibrator = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
+            val vibratorManager = getSystemService(VIBRATOR_MANAGER_SERVICE) as VibratorManager
+            vibratorManager.defaultVibrator
+        } else {
+            @Suppress("DEPRECATION")
+                    getSystemService(VIBRATOR_SERVICE) as Vibrator
+        }
 
-        audioTrack.write(audioBuffer.array(), 0, audioBuffer.array().size)
-        audioTrack.play()
-        Log.d("AudioRecord", "Played back recorded audio.")
-
-        Handler(Looper.getMainLooper()).postDelayed({
-            audioTrack.stop()
-            audioTrack.release()
-            Log.d("AudioRecord", "Playback stopped and released.")
-        }, 3000)
-        
+        val effect = VibrationEffect.createOneShot(500, VibrationEffect.DEFAULT_AMPLITUDE)
+        vibrator.vibrate(effect)
     }
 
 
 
+    // Function to update UI
+    private fun updateUIWithResults() {
+        viewPrediction = lastPrediction
+        viewConfidence = lastConfidence
+        viewDirection = lastDirection
+
+        if (viewDirection == "Right"){
+            viewDirection = "Right ➡️"
+        }
+        if (viewDirection == "Left"){
+            viewDirection = "Left ⬅️"
+        }
+        if (viewDirection == "Front"){
+            viewDirection = "Front ⬆️"
+        }
+        if (viewDirection == "Back"){
+            viewDirection = "Back ⬇️"}
+
+        if (viewDirection == "No Sound"){
+            viewDirection = "No Sound"}
+        else{
+            viewDirection = "Unknown"
+        }
 
 
+        // To activate vibration
+        if (viewPrediction != "Other") {
+            Log.d("vibrate", "Going to vibrateOneSecond() function because prediction is$lastPrediction")
+            vibrateOneSecond()
+        }
+    }
 
 
+    // playback
+    private fun playAudio(buffer: ShortArray) {
+        // Play on main thread so AudioTrack works reliably
+        handler.post {
+            try {
+                val audioTrack = AudioTrack(
+                        AudioAttributes.Builder()
+                                .setUsage(AudioAttributes.USAGE_MEDIA)
+                                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                                .build(),
+                        AudioFormat.Builder()
+                                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                                .setSampleRate(sampleRate)
+                                .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                                .build(),
+                        buffer.size * 2,
+                        AudioTrack.MODE_STATIC,
+                        AudioManager.AUDIO_SESSION_ID_GENERATE
+                )
+
+                val audioBuffer = ByteBuffer.allocate(buffer.size * 2).order(ByteOrder.LITTLE_ENDIAN)
+                buffer.forEach { audioBuffer.putShort(it) }
+                audioTrack.write(audioBuffer.array(), 0, audioBuffer.array().size)
+                audioTrack.play()
+
+                // stop after ~3s (safe guard)
+                handler.postDelayed({
+                try {
+                    audioTrack.stop()
+                    audioTrack.release()
+                } catch (e: Exception) {
+                    Log.w("AudioTrack", "stop/release error: ${e.message}")
+                }
+                }, 3100L)
+            } catch (e: Exception) {
+                Log.e("AudioTrack", "Playback failed: ${e.message}")
+            }
+        }
+    }
 
 
+    // -------------------------
+    // STOP
+    // -------------------------
+    private fun stopRecording() {
+        if (!isRecording) return
+                isRecording = false
+        try {
+            audioRecord.stop()
+            audioRecord.release()
+        } catch (_: Exception) {}
+        resultText = "Recording stopped."
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        stopRecording()
+        try { tflite.close() } catch (_: Exception) {}
+        try { espWebSocket.close() } catch (_: Exception) {}
+
+    }
 }
